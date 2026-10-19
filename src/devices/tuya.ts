@@ -2401,6 +2401,49 @@ const me201wzLevel: Tuya.ValueConverterSingle = {
     },
 };
 
+// Nova Digital ZVL-PRO schedules use the same layout as the RTX ZVG1 normal schedule timers.
+// Reports carry a 0x00 header followed by 13-byte entries that start with the slot number (0-3).
+const zvlProWeekdays: [string, number][] = [
+    ["Mo", 0x40],
+    ["Tu", 0x20],
+    ["We", 0x10],
+    ["Th", 0x08],
+    ["Fr", 0x04],
+    ["Sa", 0x02],
+    ["Su", 0x01],
+];
+const zvlProSchedule: Tuya.ValueConverterSingle = {
+    from: (v: Buffer) => {
+        const data = Buffer.from(v);
+        const entries: string[] = [];
+        for (let i = 1; i + 13 <= data.length; i += 13) {
+            const start = data.readUInt16BE(i + 1);
+            const time = `${String(Math.floor(start / 60)).padStart(2, "0")}:${String(start % 60).padStart(2, "0")}`;
+            const weekdays =
+                zvlProWeekdays
+                    .filter(([, bit]) => data[i + 5] & bit)
+                    .map(([day]) => day)
+                    .join("") || "once";
+            entries.push(`${time} / ${data.readUInt16BE(i + 3)} / ${weekdays} / ${data[i + 7]}`);
+        }
+        return entries.join("; ");
+    },
+};
+const zvlProScheduleAdd: Tuya.ValueConverterSingle = {
+    to: (v: string) => {
+        const [time = "", duration, weekdays = "MoTuWeThFrSaSu", active = "1"] = v.replace(/ /g, "").split("/");
+        const [hours, minutes] = time.split(":").map(Number);
+        const length = Number(duration);
+        if (!(hours >= 0 && hours < 24 && minutes >= 0 && minutes < 60) || !Number.isInteger(length) || length < 1 || length > 0xffff) {
+            throw new Error(`Invalid schedule '${v}', expected 'HH:MM / minutes / MoTuWeThFrSaSu / 1'`);
+        }
+        if (active !== "0" && active !== "1") throw new Error(`Invalid schedule '${v}', active must be 0 or 1`);
+        const start = hours * 60 + minutes;
+        const days = zvlProWeekdays.reduce((bits, [day, bit]) => (weekdays.includes(day) ? bits | bit : bits), 0);
+        return [0x00, 0x03, start >> 8, start & 0xff, length >> 8, length & 0xff, days, 0x40, Number(active), 0x07, 0xe6, 0x08, 0x01, 0x01];
+    },
+};
+
 export const definitions: DefinitionWithExtend[] = [
     {
         fingerprint: tuya.fingerprint("TS0601", ["_TZE284_5qfrnbqs"]),
@@ -27822,23 +27865,51 @@ export const definitions: DefinitionWithExtend[] = [
         fingerprint: tuya.fingerprint("TS0601", ["_TZE200_fphxkxue"]),
         model: "ZVL-PRO",
         vendor: "Nova Digital",
-        description: "Water walve",
-        extend: [tuya.modernExtend.tuyaBase({dp: true})],
+        description: "Water valve",
+        extend: [tuya.modernExtend.tuyaBase({dp: true, timeStart: "1970"})],
         exposes: [
             e.switch().setAccess("state", ea.STATE_SET),
             e.battery(),
             e.numeric("countdown", ea.STATE_SET).withUnit("s").withValueMin(0).withValueMax(86400).withDescription("Countdown time in seconds"),
-            e.enum("work_state", ea.STATE, ["auto", "manual", "idle"]).withDescription("Current state of operation"),
+            e
+                .enum("work_state", ea.STATE, ["auto", "manual", "idle"])
+                .withDescription("Current state of operation: auto = watering from a schedule, manual = watering started by command or button"),
+            e.numeric("water_current", ea.STATE).withUnit("L").withDescription("Consumption of the watering in progress"),
             e.numeric("water_once", ea.STATE).withUnit("L").withDescription("Consumption from the last watering"),
+            e.numeric("last_duration", ea.STATE).withUnit("s").withDescription("Duration of the last watering"),
+            e.enum("weather_delay", ea.STATE_SET, ["disabled", "24h", "48h", "72h"]).withDescription("Postpone scheduled watering"),
+            e.text("schedule", ea.STATE).withDescription("Schedules stored in the valve, separated by `;`, as `HH:MM / minutes / weekdays / active`"),
+            e
+                .text("schedule_add", ea.SET)
+                .withDescription(
+                    "Add a schedule, e.g. `05:00 / 15 / MoTuWeThFrSaSu / 1`. The valve sleeps and only accepts it shortly after it " +
+                        "transmits, e.g. right after pressing its button or while watering",
+                ),
+            e.numeric("schedule_delete", ea.SET).withValueMin(0).withValueMax(3).withDescription("Delete the schedule stored in this slot"),
         ],
         meta: {
             tuyaDatapoints: [
                 [1, "state", tuya.valueConverter.onOff],
                 [7, "battery", tuya.valueConverter.raw],
+                [
+                    10,
+                    "weather_delay",
+                    tuya.valueConverterBasic.lookup({
+                        disabled: new tuya.Enum(0),
+                        "24h": new tuya.Enum(1),
+                        "48h": new tuya.Enum(2),
+                        "72h": new tuya.Enum(3),
+                    }),
+                ],
                 [11, "countdown", tuya.valueConverter.raw],
-                [12, "work_state", tuya.valueConverter.raw],
+                [12, "work_state", tuya.valueConverterBasic.lookup({auto: new tuya.Enum(0), manual: new tuya.Enum(1), idle: new tuya.Enum(2)})],
                 [5, "water_once", tuya.valueConverter.raw],
                 [4, "fault", tuya.valueConverter.raw],
+                [15, "last_duration", tuya.valueConverter.raw],
+                [17, "schedule", zvlProSchedule],
+                [17, "schedule_add", zvlProScheduleAdd, {optimistic: false}],
+                [17, "schedule_delete", {to: (v: number) => [0x00, 0x04, v]}, {optimistic: false}],
+                [101, "water_current", tuya.valueConverter.raw],
             ],
         },
     },
